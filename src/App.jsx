@@ -1,106 +1,176 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
 
-import { useEffect, useState } from "react";
+const defaultSettings = { companyName: "", certifiedApplicatorName: "", certifiedApplicatorLicense: "", defaultCarrier: "Water" };
+const emptyChemical = { id: "", name: "", epaNumber: "", manufacturer: "", formulation: "", signalWord: "", rei: "", defaultRate: "", defaultUnit: "oz/1,000 sq ft", notes: "" };
+const emptyClient = { id: "", name: "", type: "residential", contactName: "", phone: "", email: "", billingAddress: "", siteAddress: "", sqft: "", notes: "" };
+const emptyEntry = { id: "", applicationNumber: "1", applicationDate: new Date().toISOString().slice(0, 10), startTime: "", endTime: "", clientId: "", chemicalId: "", certifiedApplicatorName: "", certifiedApplicatorLicense: "", operatorName: "", operatorLicense: "", requesterName: "", requesterPhone: "", areaTreated: "", areaUnit: "sq ft", siteType: "Turf", siteDescription: "", targetPests: "", mixRate: "", totalMixUsed: "", applicationRate: "", totalProductUsed: "", carrier: "Water", temperature: "", windSpeed: "", windDirection: "", weatherNotes: "", equipment: "", notes: "", restrictedUse: false };
 
-export default function App(){
+const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+const sortByName = (items) => [...items].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+const csvEscape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
 
-const [clients,setClients] = useState([])
-const [chemicals,setChemicals] = useState([])
-const [logs,setLogs] = useState([])
-
-const [client,setClient] = useState("")
-const [chemical,setChemical] = useState("")
-const [date,setDate] = useState("")
-const [area,setArea] = useState("")
-const [notes,setNotes] = useState("")
-
-useEffect(()=>{
-loadData()
-},[])
-
-async function loadData(){
-
-const c = await fetch("/.netlify/functions/getClients").then(r=>r.json())
-const ch = await fetch("/.netlify/functions/getChemicals").then(r=>r.json())
-const l = await fetch("/.netlify/functions/getLogs").then(r=>r.json())
-
-setClients(c)
-setChemicals(ch)
-setLogs(l)
-
+function downloadFile(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
 }
 
-async function saveLog(){
-
-const log = {
-client,
-chemical,
-date,
-area,
-notes
+function parseCsv(text) {
+  const rows = []; let current = []; let cell = ""; let inQuotes = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]; const next = text[i + 1];
+    if (ch === '"') { if (inQuotes && next === '"') { cell += '"'; i += 1; } else { inQuotes = !inQuotes; } }
+    else if (ch === "," && !inQuotes) { current.push(cell); cell = ""; }
+    else if ((ch === "\n" || ch === "\r") && !inQuotes) { if (ch === "\r" && next === "\n") i += 1; current.push(cell); if (current.some((x) => x !== "")) rows.push(current); current = []; cell = ""; }
+    else { cell += ch; }
+  }
+  if (cell.length > 0 || current.length > 0) { current.push(cell); if (current.some((x) => x !== "")) rows.push(current); }
+  if (!rows.length) return [];
+  const headers = rows[0].map((h) => h.trim());
+  return rows.slice(1).map((row) => { const obj = {}; headers.forEach((header, index) => { obj[header] = row[index] ?? ""; }); return obj; });
 }
 
-await fetch("/.netlify/functions/saveLog",{
-method:"POST",
-body:JSON.stringify(log)
-})
-
-loadData()
-
+async function parseSpreadsheetFile(file) {
+  if (file.name.toLowerCase().endsWith(".csv")) return parseCsv(await file.text());
+  const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  return sheet ? XLSX.utils.sheet_to_json(sheet, { defval: "" }) : [];
 }
 
-return (
+const extractPhone = (text) => { const m = String(text || "").match(/(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})/); return m ? m[1].replace(/\s+/g, " ").trim() : ""; };
+const cleanCustomerName = (text) => String(text || "").replace(/\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, "").replace(/\s{2,}/g, " ").trim();
+const parseSqft = (value) => { if (value === null || value === undefined || value === "") return 0; if (typeof value === "number") return value; const m = String(value).replace(/,/g, "").match(/\d+(?:\.\d+)?/); return m ? Number(m[0]) : 0; };
+const formatSqft = (value) => { const n = parseSqft(value); return n ? new Intl.NumberFormat().format(n) : ""; };
+const formatDate = (value) => { if (!value) return "—"; const d = new Date(`${value}T00:00:00`); return Number.isNaN(d.getTime()) ? value : d.toLocaleDateString(); };
+const extractFirstNumber = (text) => { const m = String(text || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/); return m ? Number(m[0]) : 0; };
+function inferRateUnitLabel(defaultUnit) { const unit = String(defaultUnit || "").toLowerCase(); if (unit.includes("fl oz")) return "fl oz"; if (unit.includes("oz")) return "oz"; if (unit.includes("lb")) return "lb"; if (unit.includes("ml")) return "mL"; if (unit.includes("gal")) return "gal"; return "units"; }
+function calculateRecommendedProduct(areaTreated, areaUnit, rateText, defaultUnit) {
+  const area = parseSqft(areaTreated); const rate = extractFirstNumber(rateText); if (!area || !rate) return "";
+  const unitText = String(defaultUnit || "").toLowerCase(); const outputUnit = inferRateUnitLabel(defaultUnit);
+  if (areaUnit === "acres") return `${Number((area * rate).toFixed(2))} ${outputUnit}`;
+  if (areaUnit === "sq ft") { let denominator = 1000; const dm = unitText.match(/\/?\s*(\d{3,5})(?:\s*sq\s*ft|\s*square\s*feet|\s*ft)/i); if (dm) denominator = Number(dm[1]); if (unitText.includes("acre")) denominator = 43560; const total = (area / denominator) * rate; return `${Number(total.toFixed(2))} ${outputUnit}`; }
+  return "";
+}
+async function parseTurfRouteWorkbook(file) {
+  const wb = XLSX.read(await file.arrayBuffer(), { type: "array" }); const importedClients = [];
+  wb.SheetNames.forEach((sheetName) => {
+    if (!/^turf/i.test(sheetName)) return;
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: "" });
+    rows.slice(4).forEach((row) => {
+      const name = cleanCustomerName(row[0]); const phone = extractPhone(row[0]); const siteAddress = String(row[1] || "").replace(/\s{2,}/g, " ").trim(); const sqft = parseSqft(row[3]);
+      if (!name || !siteAddress || !sqft) return;
+      importedClients.push({ id: uid(), name, type: /contract|commercial|business|hoa|church|school|office|apartments/i.test(sheetName) ? "commercial" : "residential", contactName: name, phone, email: "", billingAddress: siteAddress, siteAddress, sqft: String(sqft), notes: `Imported from ${sheetName}` });
+    });
+  });
+  return importedClients;
+}
+async function api(action, payload = {}) {
+  const response = await fetch("/.netlify/functions/data", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, payload }) });
+  const json = await response.json().catch(() => ({})); if (!response.ok || json.ok === false) throw new Error(json.error || "Request failed"); return json.data;
+}
+function Field({ label, children }) { return <label className="field"><span>{label}</span>{children}</label>; }
 
-<div style={{padding:20}}>
+export default function App() {
+  const [tab, setTab] = useState("log");
+  const [settings, setSettings] = useState(defaultSettings);
+  const [chemicals, setChemicals] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [entries, setEntries] = useState([]);
+  const [chemicalForm, setChemicalForm] = useState(emptyChemical);
+  const [clientForm, setClientForm] = useState(emptyClient);
+  const [entryForm, setEntryForm] = useState({ ...emptyEntry, certifiedApplicatorName: "", certifiedApplicatorLicense: "", carrier: "Water" });
+  const [entrySearch, setEntrySearch] = useState("");
+  const [entryGroup, setEntryGroup] = useState("all");
+  const [reportClient, setReportClient] = useState("all");
+  const [reportStart, setReportStart] = useState("");
+  const [reportEnd, setReportEnd] = useState("");
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const clientImportRef = useRef(null);
 
-<h1>Turf Chemical Log</h1>
+  const chemicalMap = useMemo(() => Object.fromEntries(chemicals.map((c) => [c.id, c])), [chemicals]);
+  const clientMap = useMemo(() => Object.fromEntries(clients.map((c) => [c.id, c])), [clients]);
 
-<h2>New Application</h2>
+  async function loadData(showMessage = false) {
+    try {
+      setError(""); if (showMessage) setStatus("Refreshing data...");
+      const data = await api("bootstrap");
+      setSettings({ ...defaultSettings, ...(data.settings || {}) });
+      setClients(sortByName(data.clients || []));
+      setChemicals(sortByName(data.chemicals || []));
+      setEntries(Array.isArray(data.applications) ? data.applications : []);
+      setEntryForm((current) => ({ ...current, certifiedApplicatorName: current.certifiedApplicatorName || data.settings?.certifiedApplicatorName || "", certifiedApplicatorLicense: data.settings?.certifiedApplicatorLicense || current.certifiedApplicatorLicense || "", carrier: current.carrier || data.settings?.defaultCarrier || "Water" }));
+      if (showMessage) setStatus("Data refreshed.");
+    } catch (err) { setError(err.message); }
+  }
+  useEffect(() => { loadData(); }, []);
 
-<select onChange={e=>setClient(e.target.value)}>
-<option>Select Client</option>
-{clients.map(c=>(
-<option key={c.id} value={c.name}>{c.name}</option>
-))}
-</select>
+  const filteredEntries = useMemo(() => [...entries].filter((entry) => { const client = clientMap[entry.clientId]; const chemical = chemicalMap[entry.chemicalId]; if (entryGroup !== "all" && (client?.type || "") !== entryGroup) return false; const term = entrySearch.trim().toLowerCase(); if (!term) return true; return [client?.name, client?.siteAddress, client?.phone, chemical?.name, entry.targetPests, entry.applicationDate, entry.applicationNumber, entry.requesterName].join(" ").toLowerCase().includes(term); }).sort((a, b) => { const clientA = clientMap[a.clientId]?.name || ""; const clientB = clientMap[b.clientId]?.name || ""; const typeA = clientMap[a.clientId]?.type || ""; const typeB = clientMap[b.clientId]?.type || ""; if (typeA !== typeB) return typeA.localeCompare(typeB); if (clientA !== clientB) return clientA.localeCompare(clientB); return (b.applicationDate || "").localeCompare(a.applicationDate || ""); }), [entries, entrySearch, entryGroup, clientMap, chemicalMap]);
+  const residentialEntries = filteredEntries.filter((e) => clientMap[e.clientId]?.type === "residential");
+  const commercialEntries = filteredEntries.filter((e) => clientMap[e.clientId]?.type === "commercial");
+  const sortedReportEntries = [...entries].filter((entry) => { if (reportClient !== "all" && entry.clientId !== reportClient) return false; if (reportStart && entry.applicationDate < reportStart) return false; if (reportEnd && entry.applicationDate > reportEnd) return false; return true; }).sort((a, b) => (a.applicationDate || "").localeCompare(b.applicationDate || ""));
+  const entryStats = { total: entries.length, residential: entries.filter((e) => clientMap[e.clientId]?.type === "residential").length, commercial: entries.filter((e) => clientMap[e.clientId]?.type === "commercial").length, chemicals: chemicals.length };
 
-<br/>
+  function resetEntryForm() { setEntryForm({ ...emptyEntry, applicationDate: new Date().toISOString().slice(0, 10), certifiedApplicatorName: settings.certifiedApplicatorName || "", certifiedApplicatorLicense: settings.certifiedApplicatorLicense || "", carrier: settings.defaultCarrier || "Water" }); }
+  function applyAutoCalculation(nextState) { const chem = chemicalMap[nextState.chemicalId]; const rateText = nextState.mixRate || chem?.defaultRate || ""; const defaultUnit = chem?.defaultUnit || ""; const recommended = calculateRecommendedProduct(nextState.areaTreated, nextState.areaUnit, rateText, defaultUnit); return { ...nextState, totalProductUsed: recommended || nextState.totalProductUsed }; }
+  function onClientSelect(clientId) { const client = clientMap[clientId]; setEntryForm((current) => applyAutoCalculation({ ...current, clientId, requesterName: client?.contactName || client?.name || current.requesterName, requesterPhone: client?.phone || current.requesterPhone, siteDescription: current.siteDescription || client?.siteAddress || "", areaTreated: client?.sqft || current.areaTreated || "" })); }
+  function onChemicalSelect(chemicalId) { const chem = chemicalMap[chemicalId]; setEntryForm((current) => applyAutoCalculation({ ...current, chemicalId, mixRate: current.mixRate || chem?.defaultRate || "", applicationRate: current.applicationRate || (chem?.defaultRate ? `${chem.defaultRate} ${chem.defaultUnit || ""}`.trim() : "") })); }
 
-<select onChange={e=>setChemical(e.target.value)}>
-<option>Select Chemical</option>
-{chemicals.map(c=>(
-<option key={c.id} value={c.name}>{c.name}</option>
-))}
-</select>
+  async function saveSettings() { try { setError(""); setStatus("Saving settings..."); const saved = await api("save_settings", settings); setSettings({ ...defaultSettings, ...saved }); setStatus("Settings saved."); } catch (err) { setError(err.message); } }
+  async function addChemical() { if (!chemicalForm.name.trim()) return; try { setError(""); setStatus("Saving chemical..."); await api("upsert_chemical", { ...chemicalForm, id: chemicalForm.id || uid() }); setChemicalForm(emptyChemical); await loadData(); setStatus("Chemical saved."); } catch (err) { setError(err.message); } }
+  async function addClient() { if (!clientForm.name.trim()) return; try { setError(""); setStatus("Saving client..."); await api("upsert_client", { ...clientForm, id: clientForm.id || uid(), sqft: String(parseSqft(clientForm.sqft || "")) }); setClientForm(emptyClient); await loadData(); setStatus("Client saved."); } catch (err) { setError(err.message); } }
+  async function addEntry() { if (!entryForm.clientId || !entryForm.chemicalId || !entryForm.applicationDate) { setError("Please select a client, chemical, and date."); return; } try { setError(""); setStatus("Saving application..."); await api("upsert_application", { ...entryForm, id: entryForm.id || uid(), certifiedApplicatorLicense: settings.certifiedApplicatorLicense || entryForm.certifiedApplicatorLicense }); resetEntryForm(); await loadData(); setStatus("Application saved."); setTab("applications"); } catch (err) { setError(err.message); } }
+  async function removeClient(id) { if (!window.confirm("Delete this client? Linked applications will also be removed.")) return; try { setError(""); setStatus("Deleting client..."); await api("delete_client", { id }); await loadData(); setStatus("Client deleted."); } catch (err) { setError(err.message); } }
+  async function removeChemical(id) { if (!window.confirm("Delete this chemical?")) return; try { setError(""); setStatus("Deleting chemical..."); await api("delete_chemical", { id }); await loadData(); setStatus("Chemical deleted."); } catch (err) { setError(err.message); } }
+  async function removeEntry(id) { if (!window.confirm("Delete this application?")) return; try { setError(""); setStatus("Deleting application..."); await api("delete_application", { id }); await loadData(); setStatus("Application deleted."); } catch (err) { setError(err.message); } }
+  async function importClients(event) { const file = event.target.files?.[0]; if (!file) return; try { setError(""); setStatus("Importing clients..."); const lowerName = file.name.toLowerCase(); let mapped = []; if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) { mapped = await parseTurfRouteWorkbook(file); } else if (lowerName.endsWith(".json")) { const parsedRows = JSON.parse(await file.text()); mapped = parsedRows.map((row) => ({ id: row.id || uid(), name: row.name || row.Name || "", type: String(row.type || row.Type || "residential").toLowerCase() === "commercial" ? "commercial" : "residential", contactName: row.contactName || row.ContactName || row.name || row.Name || "", phone: row.phone || row.Phone || "", email: row.email || row.Email || "", billingAddress: row.billingAddress || row.BillingAddress || row.siteAddress || row.SiteAddress || row.address || row.Address || "", siteAddress: row.siteAddress || row.SiteAddress || row.address || row.Address || "", sqft: String(parseSqft(row.sqft || row.SqFt || row.squareFootage || row["Square Footage"] || "")), notes: row.notes || row.Notes || "" })); } else { const parsedRows = await parseSpreadsheetFile(file); mapped = parsedRows.map((row) => ({ id: uid(), name: row.name || row.Name || row.client || row.Client || row.propertyName || row.PropertyName || "", type: String(row.type || row.Type || row.customerType || row.CustomerType || "residential").toLowerCase() === "commercial" ? "commercial" : "residential", contactName: row.contactName || row.ContactName || row.contact || row.Contact || row.name || row.Name || "", phone: row.phone || row.Phone || row.mobile || row.Mobile || "", email: row.email || row.Email || "", billingAddress: row.billingAddress || row.BillingAddress || row.billing || row.Billing || row.siteAddress || row.SiteAddress || row.address || row.Address || row.propertyAddress || row.PropertyAddress || "", siteAddress: row.siteAddress || row.SiteAddress || row.address || row.Address || row.propertyAddress || row.PropertyAddress || "", sqft: String(parseSqft(row.sqft || row.SqFt || row.squareFootage || row["Square Footage"] || "")), notes: row.notes || row.Notes || "" })); } mapped = mapped.filter((row) => row.name.trim() && row.siteAddress.trim()); if (!mapped.length) { setError("No valid clients were found in that file."); event.target.value = ""; return; } await api("bulk_upsert_clients", { clients: mapped }); await loadData(); setStatus(`Imported ${mapped.length} client records.`); } catch (err) { setError(err.message); } event.target.value = ""; }
+  function exportClientsTemplate() { const headers = ["name","type","contactName","phone","email","billingAddress","siteAddress","sqft","notes"]; const sample = [["Green Family","residential","Chris Green","555-555-5555","client@example.com","123 Billing St","123 Lawn Ave","12000","Front and back yard"]]; const csv = [headers, ...sample].map((row) => row.map(csvEscape).join(",")).join("\n"); downloadFile("client-import-template.csv", csv, "text/csv;charset=utf-8"); }
+  function exportBackup() { downloadFile(`turf-log-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify({ settings, chemicals, clients, entries }, null, 2), "application/json"); }
+  async function importBackup(event) { const file = event.target.files?.[0]; if (!file) return; try { setError(""); setStatus("Importing backup..."); await api("replace_all", JSON.parse(await file.text())); await loadData(); setStatus("Backup restored."); } catch (err) { setError(err.message); } event.target.value = ""; }
+  function exportEntriesCsv() { const headers = ["clientType","clientName","requesterName","requesterPhone","siteAddress","applicationNumber","applicationDate","startTime","endTime","chemicalName","epaNumber","siteType","siteDescription","targetPests","areaTreated","areaUnit","mixRate","totalMixUsed","applicationRate","totalProductUsed","carrier","temperature","windSpeed","windDirection","certifiedApplicatorName","certifiedApplicatorLicense","operatorName","operatorLicense","restrictedUse","notes"]; const rows = sortedReportEntries.map((entry) => { const client = clientMap[entry.clientId] || {}; const chem = chemicalMap[entry.chemicalId] || {}; return [client.type || "", client.name || "", entry.requesterName || client.contactName || "", entry.requesterPhone || client.phone || "", client.siteAddress || "", entry.applicationNumber, entry.applicationDate, entry.startTime, entry.endTime, chem.name || "", chem.epaNumber || "", entry.siteType, entry.siteDescription, entry.targetPests, entry.areaTreated, entry.areaUnit, entry.mixRate, entry.totalMixUsed, entry.applicationRate, entry.totalProductUsed, entry.carrier, entry.temperature, entry.windSpeed, entry.windDirection, entry.certifiedApplicatorName, entry.certifiedApplicatorLicense, entry.operatorName, entry.operatorLicense, entry.restrictedUse ? "Yes" : "No", entry.notes]; }); const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n"); downloadFile(`application-report-${new Date().toISOString().slice(0, 10)}.csv`, csv, "text/csv;charset=utf-8"); }
+  function generateHtmlReport() { const grouped = sortedReportEntries.reduce((acc, entry) => { const client = clientMap[entry.clientId] || {}; const key = `${client.type || "other"}__${client.name || "Unknown Client"}`; if (!acc[key]) acc[key] = { client, items: [] }; acc[key].items.push(entry); return acc; }, {}); const sections = Object.values(grouped).sort((a,b)=>`${a.client.type}-${a.client.name}`.localeCompare(`${b.client.type}-${b.client.name}`)).map(({client,items}) => { const rows = items.map((entry) => { const chem = chemicalMap[entry.chemicalId] || {}; return `<tr><td>${entry.applicationNumber || ""}</td><td>${entry.applicationDate || ""}</td><td>${entry.startTime || ""} - ${entry.endTime || ""}</td><td>${entry.requesterName || client.contactName || ""}</td><td>${entry.requesterPhone || client.phone || ""}</td><td>${chem.name || ""}</td><td>${chem.epaNumber || ""}</td><td>${entry.targetPests || ""}</td><td>${entry.siteType || ""}</td><td>${entry.areaTreated || ""} ${entry.areaUnit || ""}</td><td>${entry.mixRate || ""}</td><td>${entry.applicationRate || ""}</td><td>${entry.totalProductUsed || ""}</td><td>${entry.temperature || ""}</td><td>${entry.windSpeed || ""}</td><td>${entry.windDirection || ""}</td><td>${entry.certifiedApplicatorName || ""}</td><td>${entry.certifiedApplicatorLicense || ""}</td></tr>`; }).join(""); return `<section><h2>${client.name || "Unknown Client"} <span class="pill">${client.type || ""}</span></h2><p><strong>Site:</strong> ${client.siteAddress || ""}</p><p><strong>Contact:</strong> ${client.contactName || ""} ${client.phone ? `• ${client.phone}` : ""}</p><table><thead><tr><th>App #</th><th>Date</th><th>Time</th><th>Requester</th><th>Phone</th><th>Product</th><th>EPA #</th><th>Target</th><th>Site</th><th>Area</th><th>Mix Rate</th><th>Applied Rate</th><th>Total Product</th><th>Temp</th><th>Wind Speed</th><th>Wind Dir.</th><th>Applicator</th><th>License</th></tr></thead><tbody>${rows}</tbody></table></section>`; }).join(""); const html = `<!doctype html><html><head><meta charset="utf-8" /><title>Chemical Application Report</title><style>body { font-family: Arial, sans-serif; padding: 24px; color: #0f172a; } h1 { margin-bottom: 6px; } h2 { margin: 28px 0 8px; } .pill { font-size: 12px; background: #dcfce7; color: #166534; padding: 4px 8px; border-radius: 999px; } table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; } th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; vertical-align: top; } th { background: #f8fafc; } section { page-break-inside: avoid; margin-bottom: 20px; }</style></head><body><h1>${settings.companyName || "Chemical Application Report"}</h1><p>Generated ${new Date().toLocaleString()}</p><p>Records shown: ${sortedReportEntries.length}</p>${sections || "<p>No matching records found.</p>"}</body></html>`; downloadFile(`chemical-application-report-${new Date().toISOString().slice(0, 10)}.html`, html, "text/html;charset=utf-8"); }
 
-<br/>
+  function renderApplications(list) { if (!list.length) return <p className="muted">No applications found.</p>; return list.map((entry) => { const client = clientMap[entry.clientId] || {}; const chemical = chemicalMap[entry.chemicalId] || {}; return <div key={entry.id} className="record-card"><div className="record-top"><div><div className="record-title"><strong>{client.name || "Unknown Client"}</strong><span className="pill">{client.type || "unassigned"}</span><span className="pill green">App #{entry.applicationNumber}</span>{entry.restrictedUse ? <span className="pill amber">RUP</span> : null}</div><div className="muted small">{client.siteAddress || entry.siteDescription || "No site address"}</div><div className="record-grid"><div><strong>Date:</strong> {formatDate(entry.applicationDate)}</div><div><strong>Requester:</strong> {entry.requesterName || client.contactName || "—"}</div><div><strong>Phone:</strong> {entry.requesterPhone || client.phone || "—"}</div><div><strong>Chemical:</strong> {chemical.name || "—"}</div><div><strong>EPA #:</strong> {chemical.epaNumber || "—"}</div><div><strong>Target:</strong> {entry.targetPests || "—"}</div><div><strong>Area:</strong> {entry.areaTreated || "—"} {entry.areaUnit || ""}</div><div><strong>Product used:</strong> {entry.totalProductUsed || "—"}</div></div></div><button className="btn btn-danger" onClick={() => removeEntry(entry.id)}>Delete</button></div></div>; }); }
 
-<input type="date" onChange={e=>setDate(e.target.value)}/>
-
-<br/>
-
-<input placeholder="Area Treated" onChange={e=>setArea(e.target.value)}/>
-
-<br/>
-
-<textarea placeholder="Notes" onChange={e=>setNotes(e.target.value)}/>
-
-<br/>
-
-<button onClick={saveLog}>Save Log</button>
-
-<h2>Saved Logs</h2>
-
-{logs.map((l,i)=>(
-<div key={i} style={{background:"#fff",padding:10,marginBottom:10}}>
-<b>{l.client}</b> - {l.chemical}<br/>
-{l.date}<br/>
-Area: {l.area}<br/>
-{l.notes}
-</div>
-))}
-
-</div>
-
-)
-
+  return <div className="app-shell">
+    <div className="hero"><div><div className="hero-badge">Server-backed Netlify version</div><h1>Missouri Turf Chemical Log</h1><p>Full version with Netlify-backed storage, workbook import, customer phones, square-footage carryover, auto-calculated product amounts, exportable reports, and backup restore.</p></div><div className="hero-actions"><button className="btn btn-primary" onClick={exportBackup}>Export Backup</button><label className="btn">Import Backup<input type="file" accept=".json" hidden onChange={importBackup} /></label><button className="btn btn-dark" onClick={() => loadData(true)}>Refresh</button></div></div>
+    {status ? <div className="alert">{status}</div> : null}
+    {error ? <div className="alert error">{error}</div> : null}
+    <div className="stats"><div className="stat"><div className="stat-label">Saved applications</div><div className="stat-value">{entryStats.total}</div></div><div className="stat"><div className="stat-label">Residential</div><div className="stat-value">{entryStats.residential}</div></div><div className="stat"><div className="stat-label">Commercial</div><div className="stat-value">{entryStats.commercial}</div></div><div className="stat"><div className="stat-label">Chemicals</div><div className="stat-value">{entryStats.chemicals}</div></div></div>
+    <div className="tabs">{["log","applications","clients","chemicals","reports"].map((name) => <button key={name} className={`tab ${tab === name ? "active" : ""}`} onClick={() => setTab(name)}>{name === "log" ? "New Log" : name === "applications" ? "Applications" : name === "clients" ? "Clients" : name === "chemicals" ? "Chemicals" : "Reports & Settings"}</button>)}</div>
+    {tab === "log" && <div className="layout"><div className="panel"><h2>Application record</h2><p className="muted">Select the customer first to auto-fill phone, address, and square footage.</p><div className="form-grid">
+      <Field label="Application #"><select value={entryForm.applicationNumber} onChange={(e) => setEntryForm({ ...entryForm, applicationNumber: e.target.value })}>{["1","2","3","4","5"].map((n) => <option key={n} value={n}>{n}</option>)}</select></Field>
+      <Field label="Application date"><input type="date" value={entryForm.applicationDate} onChange={(e) => setEntryForm({ ...entryForm, applicationDate: e.target.value })} /></Field>
+      <Field label="Client / job"><select value={entryForm.clientId} onChange={(e) => onClientSelect(e.target.value)}><option value="">Select imported customer</option>{clients.map((client) => <option key={client.id} value={client.id}>{client.name} • {client.type}{client.sqft ? ` • ${formatSqft(client.sqft)} sqft` : ""}</option>)}</select></Field>
+      <Field label="Start time"><input type="time" value={entryForm.startTime} onChange={(e) => setEntryForm({ ...entryForm, startTime: e.target.value })} /></Field>
+      <Field label="End time"><input type="time" value={entryForm.endTime} onChange={(e) => setEntryForm({ ...entryForm, endTime: e.target.value })} /></Field>
+      <Field label="Site type"><select value={entryForm.siteType} onChange={(e) => setEntryForm({ ...entryForm, siteType: e.target.value })}>{["Turf","Ornamental","Landscape Bed","Tree/Shrub","Other"].map((v) => <option key={v} value={v}>{v}</option>)}</select></Field>
+      <Field label="Customer / requester name"><input value={entryForm.requesterName} onChange={(e) => setEntryForm({ ...entryForm, requesterName: e.target.value })} /></Field>
+      <Field label="Customer phone"><input value={entryForm.requesterPhone} onChange={(e) => setEntryForm({ ...entryForm, requesterPhone: e.target.value })} /></Field>
+      <Field label="Chemical used"><select value={entryForm.chemicalId} onChange={(e) => onChemicalSelect(e.target.value)}><option value="">Select saved chemical</option>{chemicals.map((chemical) => <option key={chemical.id} value={chemical.id}>{chemical.name}</option>)}</select></Field>
+      <Field label="Target pest(s)"><input value={entryForm.targetPests} onChange={(e) => setEntryForm({ ...entryForm, targetPests: e.target.value })} /></Field>
+      <Field label="Area treated"><div className="inline-group"><input value={entryForm.areaTreated} onChange={(e) => setEntryForm(applyAutoCalculation({ ...entryForm, areaTreated: e.target.value }))} /><select value={entryForm.areaUnit} onChange={(e) => setEntryForm(applyAutoCalculation({ ...entryForm, areaUnit: e.target.value }))}>{["sq ft","acres","linear ft"].map((v) => <option key={v} value={v}>{v}</option>)}</select></div></Field>
+      <Field label="Site description"><input value={entryForm.siteDescription} onChange={(e) => setEntryForm({ ...entryForm, siteDescription: e.target.value })} /></Field>
+      <Field label="Mix rate"><input value={entryForm.mixRate} onChange={(e) => setEntryForm(applyAutoCalculation({ ...entryForm, mixRate: e.target.value }))} /></Field>
+      <Field label="Total mix used"><input value={entryForm.totalMixUsed} onChange={(e) => setEntryForm({ ...entryForm, totalMixUsed: e.target.value })} /></Field>
+      <Field label="Application rate"><input value={entryForm.applicationRate} onChange={(e) => setEntryForm({ ...entryForm, applicationRate: e.target.value })} /></Field>
+      <Field label="Recommended / actual product used"><input value={entryForm.totalProductUsed} onChange={(e) => setEntryForm({ ...entryForm, totalProductUsed: e.target.value })} /></Field>
+      <Field label="Carrier"><input value={entryForm.carrier} onChange={(e) => setEntryForm({ ...entryForm, carrier: e.target.value })} /></Field>
+      <Field label="Air temp"><input value={entryForm.temperature} onChange={(e) => setEntryForm({ ...entryForm, temperature: e.target.value })} /></Field>
+      <Field label="Wind speed"><input value={entryForm.windSpeed} onChange={(e) => setEntryForm({ ...entryForm, windSpeed: e.target.value })} /></Field>
+      <Field label="Wind direction"><input value={entryForm.windDirection} onChange={(e) => setEntryForm({ ...entryForm, windDirection: e.target.value })} /></Field>
+      <Field label="Certified applicator name"><input value={entryForm.certifiedApplicatorName} onChange={(e) => setEntryForm({ ...entryForm, certifiedApplicatorName: e.target.value })} /></Field>
+      <Field label="Applicator license #"><input value={entryForm.certifiedApplicatorLicense} onChange={(e) => setEntryForm({ ...entryForm, certifiedApplicatorLicense: e.target.value })} /></Field>
+      <Field label="Operator / technician name"><input value={entryForm.operatorName} onChange={(e) => setEntryForm({ ...entryForm, operatorName: e.target.value })} /></Field>
+      <Field label="Operator / technician license #"><input value={entryForm.operatorLicense} onChange={(e) => setEntryForm({ ...entryForm, operatorLicense: e.target.value })} /></Field>
+      <Field label="Equipment used"><input value={entryForm.equipment} onChange={(e) => setEntryForm({ ...entryForm, equipment: e.target.value })} /></Field>
+    </div><div className="two-col"><Field label="Weather / site notes"><textarea rows="5" value={entryForm.weatherNotes} onChange={(e) => setEntryForm({ ...entryForm, weatherNotes: e.target.value })} /></Field><Field label="General notes"><textarea rows="5" value={entryForm.notes} onChange={(e) => setEntryForm({ ...entryForm, notes: e.target.value })} /></Field></div><label className="checkbox-row"><input type="checkbox" checked={entryForm.restrictedUse} onChange={(e) => setEntryForm({ ...entryForm, restrictedUse: e.target.checked })} /><span>Restricted-use pesticide</span></label><div className="actions"><button className="btn btn-primary" onClick={addEntry}>Save application</button><button className="btn" onClick={resetEntryForm}>Clear form</button></div></div><div className="panel"><h2>Auto-calc</h2><p className="muted">Calculated from customer square footage and chemical rate, but always editable.</p><ul className="tip-list"><li>Select a customer to auto-fill phone, address, and square footage.</li><li>Select a chemical to pull in its default rate.</li><li>The app recommends total product used based on sqft and rate.</li><li>You can override the amount anytime for a partial yard or lighter application.</li></ul></div></div>}
+    {tab === "applications" && <div className="panel" style={{ marginTop: 16 }}><h2>Saved applications</h2><div className="toolbar"><input placeholder="Search by client, phone, date, chemical, target pest..." value={entrySearch} onChange={(e) => setEntrySearch(e.target.value)} /><select value={entryGroup} onChange={(e) => setEntryGroup(e.target.value)}><option value="all">All groups</option><option value="residential">Residential</option><option value="commercial">Commercial</option></select></div>{(entryGroup === "all" || entryGroup === "residential") && <><h3>Residential ({residentialEntries.length})</h3>{renderApplications(residentialEntries)}</>}{(entryGroup === "all" || entryGroup === "commercial") && <><h3>Commercial ({commercialEntries.length})</h3>{renderApplications(commercialEntries)}</>}</div>}
+    {tab === "clients" && <div className="layout-wide"><div className="panel"><h2>Add client</h2><div className="form-grid"><Field label="Client / property name"><input value={clientForm.name} onChange={(e) => setClientForm({ ...clientForm, name: e.target.value })} /></Field><Field label="Type"><select value={clientForm.type} onChange={(e) => setClientForm({ ...clientForm, type: e.target.value })}><option value="residential">Residential</option><option value="commercial">Commercial</option></select></Field><Field label="Contact name"><input value={clientForm.contactName} onChange={(e) => setClientForm({ ...clientForm, contactName: e.target.value })} /></Field><Field label="Phone"><input value={clientForm.phone} onChange={(e) => setClientForm({ ...clientForm, phone: e.target.value })} /></Field><Field label="Email"><input value={clientForm.email} onChange={(e) => setClientForm({ ...clientForm, email: e.target.value })} /></Field><Field label="Billing address"><input value={clientForm.billingAddress} onChange={(e) => setClientForm({ ...clientForm, billingAddress: e.target.value })} /></Field><Field label="Site address"><input value={clientForm.siteAddress} onChange={(e) => setClientForm({ ...clientForm, siteAddress: e.target.value })} /></Field><Field label="Square footage"><input value={clientForm.sqft} onChange={(e) => setClientForm({ ...clientForm, sqft: e.target.value })} /></Field></div><Field label="Notes"><textarea rows="4" value={clientForm.notes} onChange={(e) => setClientForm({ ...clientForm, notes: e.target.value })} /></Field><div className="actions"><button className="btn btn-primary" onClick={addClient}>Add client</button></div></div><div className="panel"><h2>Import clients</h2><p className="muted">Excel import reads every sheet that starts with “Turf”, pulls name + phone from column A, address from column B, and square footage from column D.</p><div className="actions"><button className="btn" onClick={exportClientsTemplate}>Download template</button><button className="btn btn-primary" onClick={() => clientImportRef.current?.click()}>Import clients</button><input ref={clientImportRef} type="file" accept=".csv,.xlsx,.xls,.json" hidden onChange={importClients} /></div><h3>Client database</h3><div className="list">{clients.length ? clients.map((client) => <div key={client.id} className="record-card"><div className="record-top"><div><div className="record-title"><strong>{client.name}</strong><span className="pill">{client.type}</span></div><div className="muted small">{client.siteAddress || "No site address"}</div><div className="muted small">{client.contactName || "No contact"}{client.phone ? ` • ${client.phone}` : ""}</div><div className="muted small">{client.sqft ? `${formatSqft(client.sqft)} sqft` : "No sqft saved"}</div></div><button className="btn btn-danger" onClick={() => removeClient(client.id)}>Delete</button></div></div>) : <p className="muted">No clients saved yet.</p>}</div></div></div>}
+    {tab === "chemicals" && <div className="layout-wide"><div className="panel"><h2>Add chemical</h2><div className="form-grid"><Field label="Product name"><input value={chemicalForm.name} onChange={(e) => setChemicalForm({ ...chemicalForm, name: e.target.value })} /></Field><Field label="EPA registration #"><input value={chemicalForm.epaNumber} onChange={(e) => setChemicalForm({ ...chemicalForm, epaNumber: e.target.value })} /></Field><Field label="Manufacturer"><input value={chemicalForm.manufacturer} onChange={(e) => setChemicalForm({ ...chemicalForm, manufacturer: e.target.value })} /></Field><Field label="Formulation"><input value={chemicalForm.formulation} onChange={(e) => setChemicalForm({ ...chemicalForm, formulation: e.target.value })} /></Field><Field label="Signal word"><input value={chemicalForm.signalWord} onChange={(e) => setChemicalForm({ ...chemicalForm, signalWord: e.target.value })} /></Field><Field label="REI"><input value={chemicalForm.rei} onChange={(e) => setChemicalForm({ ...chemicalForm, rei: e.target.value })} /></Field><Field label="Default rate"><input value={chemicalForm.defaultRate} onChange={(e) => setChemicalForm({ ...chemicalForm, defaultRate: e.target.value })} /></Field><Field label="Default rate unit"><input value={chemicalForm.defaultUnit} onChange={(e) => setChemicalForm({ ...chemicalForm, defaultUnit: e.target.value })} /></Field></div><Field label="Notes"><textarea rows="4" value={chemicalForm.notes} onChange={(e) => setChemicalForm({ ...chemicalForm, notes: e.target.value })} /></Field><div className="actions"><button className="btn btn-primary" onClick={addChemical}>Add chemical</button></div></div><div className="panel"><h2>Chemical database</h2><div className="list">{chemicals.length ? chemicals.map((chemical) => <div key={chemical.id} className="record-card"><div className="record-top"><div><div className="record-title"><strong>{chemical.name}</strong>{chemical.epaNumber ? <span className="pill">EPA {chemical.epaNumber}</span> : null}</div><div className="muted small">{chemical.manufacturer || ""}{chemical.formulation ? ` • ${chemical.formulation}` : ""}</div><div className="muted small">Default rate: {chemical.defaultRate || "—"} {chemical.defaultUnit || ""}</div></div><button className="btn btn-danger" onClick={() => removeChemical(chemical.id)}>Delete</button></div></div>) : <p className="muted">No chemicals saved yet.</p>}</div></div></div>}
+    {tab === "reports" && <div className="layout"><div className="panel"><h2>Company & defaults</h2><div className="form-grid"><Field label="Company name"><input value={settings.companyName} onChange={(e) => setSettings({ ...settings, companyName: e.target.value })} /></Field><Field label="Certified applicator name"><input value={settings.certifiedApplicatorName} onChange={(e) => setSettings({ ...settings, certifiedApplicatorName: e.target.value })} /></Field><Field label="Applicator license #"><input value={settings.certifiedApplicatorLicense} onChange={(e) => setSettings({ ...settings, certifiedApplicatorLicense: e.target.value })} /></Field><Field label="Default carrier"><input value={settings.defaultCarrier} onChange={(e) => setSettings({ ...settings, defaultCarrier: e.target.value })} /></Field></div><div className="actions"><button className="btn btn-primary" onClick={saveSettings}>Save settings</button></div></div><div className="panel"><h2>Generate reports</h2><div className="form-grid"><Field label="Client filter"><select value={reportClient} onChange={(e) => setReportClient(e.target.value)}><option value="all">All clients</option>{clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}</select></Field><Field label="Start date"><input type="date" value={reportStart} onChange={(e) => setReportStart(e.target.value)} /></Field><Field label="End date"><input type="date" value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} /></Field></div><div className="actions"><button className="btn btn-dark" onClick={generateHtmlReport}>Export detailed HTML report</button><button className="btn" onClick={exportEntriesCsv}>Export CSV</button></div><p className="muted">Matching records: {sortedReportEntries.length}</p><p className="muted">This version stores records on Netlify, but it does not include login protection yet.</p></div></div>}
+  </div>;
 }

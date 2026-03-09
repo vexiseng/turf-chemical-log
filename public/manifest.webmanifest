@@ -1,0 +1,9 @@
+{
+  "name": "Missouri Turf Chemical Log",
+  "short_name": "Turf Log",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f8f5",
+  "theme_color": "#0f172a",
+  "icons": []
+}
